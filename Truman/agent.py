@@ -150,7 +150,7 @@ class PlayerAgent:
         if (self.my_last_loc is not None and 
             my_current_loc == my_spawn and 
             self.my_last_loc != my_spawn):
-            # print(f"I was reset! Trapdoor must be at {self.my_last_loc}")
+
             self._set_trapdoor_found(self.my_last_loc)
 
         # Check if OPPONENT was reset

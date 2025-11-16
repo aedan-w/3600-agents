@@ -56,12 +56,7 @@ def choose_move(board: board.Board, valid_moves: List[Tuple[Direction, MoveType]
             best_move = egg_move
         
         # Fallback to PLAIN:
-        elif plain_move in valid_moves:
-            best_move = plain_move
-        
-        # Absolute fallback (if our 'best_direction' logic failed, e.g. only EGG/TURD moves were possible)
         else:
-            # Just pick the first valid move from the list
-            best_move = valid_moves[0]
+            best_move = plain_move
 
     return best_move
