@@ -280,11 +280,11 @@ class PlayerAgent:
         # print(f"Playing move: {result}")
 
         # --- 5. Store state for next turn's deductions ---
-        direction, _ = result
-        print(result)
-        # We store our *intended* next location
-        self.my_last_loc = board.chicken_player.get_next_loc(direction)
-        # We store the opponent's *current* location
-        self.opponent_last_loc = opponent_current_loc
+        # direction, _ = result
+        # print(result)
+        # # We store our *intended* next location
+        # self.my_last_loc = board.chicken_player.get_next_loc(direction)
+        # # We store the opponent's *current* location
+        # self.opponent_last_loc = opponent_current_loc
 
-        return result
+        # return result
