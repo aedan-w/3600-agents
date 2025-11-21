@@ -5,10 +5,9 @@ from typing import List, Set, Tuple
 import numpy as np
 from game import board
 from game.enums import Direction, MoveType
-from . import decision_maker
 
 """
-    ye we finna make it fr - aedan
+    hey hillegass.
 """
 
 class PlayerAgent:
@@ -23,10 +22,7 @@ class PlayerAgent:
         """
         self.board_size = board.game_map.MAP_SIZE
         
-        # self.white_trapdoor_probs: Probability of trapdoor on an EVEN square (i+j is even)
         self.white_trapdoor_probs = np.zeros((self.board_size, self.board_size))
-        
-        # self.black_trapdoor_probs: Probability of trapdoor on an ODD square (i+j is odd)
         self.black_trapdoor_probs = np.zeros((self.board_size, self.board_size))
         
         # Track previous locations to deduce when a trapdoor is hit
@@ -39,13 +35,9 @@ class PlayerAgent:
         # --- End of New ---
 
         self._initialize_probabilities()
+        self.parity = (board.chicken_player.get_spawn()[0] + board.chicken_player.get_spawn()[1]) % 2
 
-        
-        # print("initialized.")
-        # print("Initial White Trapdoor Probabilities:")
-        # print(np.round(self.white_trapdoor_probs, 3))
-        # print("Initial Black Trapdoor Probabilities:")
-        # print(np.round(self.black_trapdoor_probs, 3))
+
 
 
     def _initialize_probabilities(self):
@@ -55,16 +47,12 @@ class PlayerAgent:
         """
         weights = np.zeros((self.board_size, self.board_size))
         
-        # Weight 0: Rows/Cols 0, 1, 6, 7
-        # Weight 1: Rows/Cols 2, 5 (indices 2:6)
         weights[2:6, 2:6] = 1.0
-        # Weight 2: Rows/Cols 3, 4 (indices 3:5)
         weights[3:5, 3:5] = 2.0
 
         total_white_weight = 0
         total_black_weight = 0
 
-        # Assign weights to the correct parity map
         for r in range(self.board_size):
             for c in range(self.board_size):
                 if (r + c) % 2 == 0:  # White square
@@ -138,6 +126,90 @@ class PlayerAgent:
                 # print(f"** Confirmed BLACK trapdoor at {loc} **")
                 self.black_trapdoor_probs = np.zeros((self.board_size, self.board_size))
                 self.black_trapdoor_probs[r, c] = 1.0
+
+    def get_canonical_state(self, board_obj):
+        """
+        Normalizes the board so the Agent ALWAYS plays as if it is:
+        1. On the Left Edge (x=0)
+        2. In the Top Half (y < 4)
+        
+        The Opponent will always appear on the Right Edge (x=7), Top Half (y < 4).
+        """
+        # Get raw locations
+        my_loc = board_obj.chicken_player.get_location()
+        opp_loc = board_obj.chicken_enemy.get_location()
+        
+        spawn = board_obj.chicken_player.get_spawn()
+        
+        # --- STEP 1: DETECT TRANSFORMS ---
+        # 1. Transpose (Swap X/Y) if we are on Top/Bottom edges
+        #    (This moves us to Left/Right edges)
+        self.needs_transpose = (spawn[1] == 0 or spawn[1] == self.board_size - 1)
+        
+        # Apply Transpose temporarily to check for Flips
+        temp_x = spawn[1] if self.needs_transpose else spawn[0]
+        temp_y = spawn[0] if self.needs_transpose else spawn[1]
+        
+        # 2. Horizontal Flip (if we are on the Right side)
+        self.needs_h_flip = (temp_x >= self.board_size // 2)
+        
+        # 3. Vertical Flip (if we are on the Bottom half)
+        self.needs_v_flip = (temp_y >= self.board_size // 2)
+
+        # --- HELPER FUNCTION ---
+        def transform(loc):
+            x, y = loc
+            # 1. Transpose
+            if self.needs_transpose:
+                x, y = y, x
+            # 2. Horizontal Flip (x -> 7-x)
+            if self.needs_h_flip:
+                x = (self.board_size - 1) - x
+            # 3. Vertical Flip (y -> 7-y)
+            if self.needs_v_flip:
+                y = (self.board_size - 1) - y
+            return (x, y)
+
+        # --- CREATE CANONICAL STATE ---
+        canonical_state = {
+            "my_loc": transform(my_loc),
+            "opp_loc": transform(opp_loc),
+            "my_eggs": {transform(l) for l in board_obj.eggs_player},
+            "opp_eggs": {transform(l) for l in board_obj.eggs_enemy},
+            "my_turds": {transform(l) for l in board_obj.turds_player},
+            "opp_turds": {transform(l) for l in board_obj.turds_enemy}
+        }
+        
+        return canonical_state
+
+    def get_real_move(self, canonical_move):
+        """
+        Converts the 'Canonical Move' (made in the normalized Top-Left world)
+        back into the 'Real World Move' by reversing the transforms.
+        """
+        direction, move_type = canonical_move
+        
+        # Reverse order: V-Flip -> H-Flip -> Transpose
+        
+        # 1. Reverse Vertical Flip (UP <-> DOWN)
+        if self.needs_v_flip:
+            if direction == Direction.UP: direction = Direction.DOWN
+            elif direction == Direction.DOWN: direction = Direction.UP
+            
+        # 2. Reverse Horizontal Flip (LEFT <-> RIGHT)
+        if self.needs_h_flip:
+            if direction == Direction.LEFT: direction = Direction.RIGHT
+            elif direction == Direction.RIGHT: direction = Direction.LEFT
+            
+        # 3. Reverse Transpose (Swap Axes)
+        # Map: UP->LEFT, DOWN->RIGHT, LEFT->UP, RIGHT->DOWN
+        if self.needs_transpose:
+            if direction == Direction.UP: direction = Direction.LEFT
+            elif direction == Direction.DOWN: direction = Direction.RIGHT
+            elif direction == Direction.LEFT: direction = Direction.UP
+            elif direction == Direction.RIGHT: direction = Direction.DOWN
+            
+        return (direction, move_type)
 
     def play(
         self,
@@ -213,6 +285,16 @@ class PlayerAgent:
             # print("No valid moves available!")
             return (Direction.UP, MoveType.PLAIN)
         
+        ## AEDAN
+        # sets me to the left, opp on the right.
+        # cstate = canonical state
+        cstate = self.get_canonical_state(board)
+        if board.turns_left_player > 38:
+            if board.chicken_player.can_lay_egg():
+                return self.get_real_move((Direction.RIGHT, MoveType.EGG))
+            # elif cstate # I'M DOING THIS RIGHT NOW
+            return self.get_real_move((Direction.RIGHT, MoveType.PLAIN))
+
         # Store moves as (score, move) tuples for sorting
         safe_egg_moves = []
         safe_turd_moves = []

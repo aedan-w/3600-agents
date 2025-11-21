@@ -1,7 +1,5 @@
 import os
-import time
 import numpy as np
-from collections import deque
 from collections.abc import Callable
 from typing import List, Tuple
 
@@ -20,7 +18,8 @@ except ImportError:
 # --- 2. Define the Network ---
 if TORCH_AVAILABLE:
     class SimpleNet(nn.Module):
-        def __init__(self, spatial_channels=9, non_spatial_features=4):
+        # CHANGED: spatial_channels default increased from 7 to 8
+        def __init__(self, spatial_channels=8, non_spatial_features=4):
             super(SimpleNet, self).__init__()
             self.conv1 = nn.Conv2d(spatial_channels, 16, kernel_size=3, padding=1)
             self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
@@ -45,39 +44,37 @@ class PlayerAgent:
         self.device = torch.device("cpu")
         self.board_size = 8
         
-        # --- MEMORY (Anti-Oscillation) ---
-        # We track the last 8 locations to prevent A->B->A loops AND A->B->C->A loops
-        self.past_moves = deque(maxlen=8)
-        self.visited = np.zeros((8, 8)) 
-        self.my_last_loc = None         
-        self.opponent_last_loc = None
-        # ---------------------------------
-        
-        # Truman Logic
+        # --- TRUMAN LOGIC: Init Probabilities ---
         self.white_trapdoor_probs = np.zeros((8, 8))
         self.black_trapdoor_probs = np.zeros((8, 8))
+        self.my_last_loc = None
+        self.opponent_last_loc = None
         self._initialize_probabilities()
+        # ----------------------------------------
 
         if TORCH_AVAILABLE:
             if torch.cuda.is_available():
                 self.device = torch.device("cuda")
             
-            self.net = SimpleNet(spatial_channels=9).to(self.device)
+            # Initialize Net with 8 channels
+            self.net = SimpleNet(spatial_channels=8).to(self.device)
             
             script_location = os.path.dirname(os.path.realpath(__file__))
             model_path = os.path.join(script_location, "agent_model.pth")
             
             if os.path.exists(model_path):
                 try:
+                    # Note: This might fail if you load an OLD 7-channel model.
+                    # You will need to RETRAIN immediately after this.
                     self.net.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
                     self.net.eval()
                 except Exception as e:
-                    print(f"Castle Warning: Failed to load model: {e}")
+                    print(f"Castle Warning: Failed to load model (Arch Mismatch?): {e}")
                     self.net = None 
             else:
                 self.net = None
 
-    # --- TRUMAN HELPERS ---
+    # --- TRUMAN HELPER METHODS ---
     def _initialize_probabilities(self):
         weights = np.zeros((8, 8))
         weights[2:6, 2:6] = 1.0
@@ -118,16 +115,17 @@ class PlayerAgent:
         else:
             self.black_trapdoor_probs = np.zeros((8, 8))
             self.black_trapdoor_probs[r, c] = 1.0
+    # -----------------------------
 
     def _featurize(self, board_obj):
-        my_loc_map = torch.zeros((8, 8))
-        opp_loc_map = torch.zeros((8, 8))
-        my_eggs_map = torch.zeros((8, 8))
-        opp_eggs_map = torch.zeros((8, 8))
-        my_turds_map = torch.zeros((8, 8))
-        opp_turds_map = torch.zeros((8, 8))
-        opp_turd_zone_map = torch.zeros((8, 8))
-        egg_potential_map = torch.zeros((8, 8)) 
+        # Existing 7 Channels
+        my_loc_map = torch.zeros((8, 8), dtype=torch.float32)
+        opp_loc_map = torch.zeros((8, 8), dtype=torch.float32)
+        my_eggs_map = torch.zeros((8, 8), dtype=torch.float32)
+        opp_eggs_map = torch.zeros((8, 8), dtype=torch.float32)
+        my_turds_map = torch.zeros((8, 8), dtype=torch.float32)
+        opp_turds_map = torch.zeros((8, 8), dtype=torch.float32)
+        opp_turd_zone_map = torch.zeros((8, 8), dtype=torch.float32)
 
         my_loc = board_obj.chicken_player.get_location()
         my_loc_map[my_loc[1], my_loc[0]] = 1.0
@@ -142,13 +140,14 @@ class PlayerAgent:
                 if loc in board_obj.turds_player: my_turds_map[r, c] = 1.0
                 if loc in board_obj.turds_enemy: opp_turds_map[r, c] = 1.0
                 if board_obj.is_cell_in_enemy_turd_zone(loc): opp_turd_zone_map[r, c] = 1.0
-                if board_obj.can_lay_egg_at_loc(loc): egg_potential_map[r, c] = 1.0
-
+        
+        # --- NEW CHANNEL 8: RISK MAP ---
+        # We combine the white and black probs into one "Danger Map"
         risk_map = torch.tensor(self.white_trapdoor_probs + self.black_trapdoor_probs, dtype=torch.float32)
         
         spatial = torch.stack([
             my_loc_map, opp_loc_map, my_eggs_map, opp_eggs_map,
-            my_turds_map, opp_turds_map, opp_turd_zone_map, risk_map, egg_potential_map
+            my_turds_map, opp_turds_map, opp_turd_zone_map, risk_map
         ]).unsqueeze(0).to(self.device)
 
         non_spatial = torch.tensor([
@@ -160,72 +159,13 @@ class PlayerAgent:
 
         return spatial, non_spatial
 
-    def _evaluate(self, board_obj):
-        if self.net is None: return 0.0
-        
-        # 1. Get Neural Network Score
-        spatial, non_spatial = self._featurize(board_obj)
-        with torch.no_grad():
-            score = self.net(spatial, non_spatial).item()
-            
-        # 2. APPLY ANTI-OSCILLATION HEURISTICS
-        sim_loc = board_obj.chicken_player.get_location()
-        r, c = sim_loc[1], sim_loc[0]
-        
-        # Penalize stepping on ANY of the last 8 squares we occupied
-        # This forces the agent to always seek new ground
-        if sim_loc in self.past_moves:
-            score -= 0.5
-            
-        # Penalize revisiting old ground (General Exploration)
-        if self.visited[r, c] > 0:
-            score -= 0.1
-            
-        return score
-
-    # --- ALPHA BETA SEARCH ---
-    def alphabeta(self, board_obj, depth, alpha, beta, start_time, time_limit):
-        if time.time() - start_time > time_limit: return None 
-        if depth == 0 or board_obj.is_game_over(): return self._evaluate(board_obj)
-
-        valid_moves = board_obj.get_valid_moves()
-        if not valid_moves: return -1.0 
-
-        # Search Egg moves first to find wins faster
-        valid_moves.sort(key=lambda m: m[1] == MoveType.EGG, reverse=True)
-
-        best_val = -float('inf')
-        
-        for move in valid_moves:
-            next_board = board_obj.forecast_move(move[0], move[1])
-            if next_board is None: continue
-            
-            next_board.reverse_perspective() 
-            val = self.alphabeta(next_board, depth - 1, -beta, -alpha, start_time, time_limit)
-            
-            if val is None: return None
-            val = -val
-            
-            best_val = max(best_val, val)
-            alpha = max(alpha, best_val)
-            if beta <= alpha: break 
-                
-        return best_val
-
     def play(self, board_obj: game_board.Board, sensor_data, time_left):
-        start_time = time.time()
         my_current_loc = board_obj.chicken_player.get_location()
         my_spawn = board_obj.chicken_player.get_spawn()
         opponent_current_loc = board_obj.chicken_enemy.get_location()
         opponent_spawn = board_obj.chicken_enemy.get_spawn()
 
-        # --- UPDATE MEMORY ---
-        # Add current location to history to ban returning here soon
-        self.past_moves.append(my_current_loc)
-        self.visited[my_current_loc[1], my_current_loc[0]] = 1
-        # ---------------------
-
-        # Update Probabilities
+        # --- TRUMAN LOGIC: Update Beliefs ---
         if (self.my_last_loc is not None and my_current_loc == my_spawn and self.my_last_loc != my_spawn):
             self._set_trapdoor_found(self.my_last_loc)
         if (self.opponent_last_loc is not None and opponent_current_loc == opponent_spawn and self.opponent_last_loc != opponent_spawn):
@@ -235,57 +175,59 @@ class PlayerAgent:
         (hear_black, feel_black) = sensor_data[1]
         
         white_update = np.zeros((8, 8)); black_update = np.zeros((8, 8))
+        
         for r in range(8):
             for c in range(8):
                 loc = (c, r)
                 p_h = self._get_hear_prob(my_current_loc, loc)
                 p_f = self._get_feel_prob(my_current_loc, loc)
-                ph_w = p_h if hear_white else (1.0 - p_h); pf_w = p_f if feel_white else (1.0 - p_f)
+                
+                ph_w = p_h if hear_white else (1.0 - p_h)
+                pf_w = p_f if feel_white else (1.0 - p_f)
                 white_update[r, c] = ph_w * pf_w
-                ph_b = p_h if hear_black else (1.0 - p_h); pf_b = p_f if feel_black else (1.0 - p_f)
+                
+                ph_b = p_h if hear_black else (1.0 - p_h)
+                pf_b = p_f if feel_black else (1.0 - p_f)
                 black_update[r, c] = ph_b * pf_b
-        self.white_trapdoor_probs *= white_update; self.black_trapdoor_probs *= black_update
-        if np.sum(self.white_trapdoor_probs) > 0: self.white_trapdoor_probs /= np.sum(self.white_trapdoor_probs)
-        if np.sum(self.black_trapdoor_probs) > 0: self.black_trapdoor_probs /= np.sum(self.black_trapdoor_probs)
+
+        self.white_trapdoor_probs *= white_update
+        self.black_trapdoor_probs *= black_update
         
-        # Search
+        s_w = np.sum(self.white_trapdoor_probs)
+        s_b = np.sum(self.black_trapdoor_probs)
+        if s_w > 0: self.white_trapdoor_probs /= s_w
+        if s_b > 0: self.black_trapdoor_probs /= s_b
+        # --------------------------------------
+
         valid_moves = board_obj.get_valid_moves()
         if not valid_moves: return (Direction.UP, MoveType.PLAIN)
 
+        if self.net is None:
+            import random
+            return random.choice(valid_moves)
+
         best_move = valid_moves[0]
-        search_time = .2
+        best_score = -float('inf')
+
+        for move in valid_moves:
+            direction, m_type = move
+            future_board = board_obj.forecast_move(direction, m_type)
+            
+            if future_board is not None:
+                # _featurize now includes the updated risk map!
+                spatial, non_spatial = self._featurize(future_board)
+                
+                with torch.no_grad():
+                    score = self.net(spatial, non_spatial).item()
+                
+                if m_type == MoveType.EGG: score += 0.1 
+                if score > best_score:
+                    best_score = score
+                    best_move = move
         
-        for depth in range(1, 10): 
-            current_best_move = None
-            current_best_val = -float('inf')
-            
-            for move in valid_moves:
-                next_board = board_obj.forecast_move(move[0], move[1])
-                if next_board is None: continue
-                next_board.reverse_perspective()
-                
-                val = self.alphabeta(next_board, depth - 1, -float('inf'), float('inf'), start_time, search_time)
-                
-                if val is None: break 
-                val = -val
-                
-                # --- AGGRESSIVE EGG INCENTIVE ---
-                # If the NN says the move is safe (-0.2 or higher), we MASSIVELY boost eggs.
-                # This overrides "Safety" slightly to favor "Winning".
-                if move[1] == MoveType.EGG: 
-                    val += 0.25
-
-                if val > current_best_val:
-                    current_best_val = val
-                    current_best_move = move
-            
-            if val is None: break
-            best_move = current_best_move
-            
-            # Print to confirm logic
-            # print(f"Depth {depth} Best: {best_move} Score: {current_best_val:.3f}")
-
+        # Store state for next turn
         d, _ = best_move
         self.my_last_loc = board_obj.chicken_player.get_next_loc(d)
         self.opponent_last_loc = opponent_current_loc
+
         return best_move
